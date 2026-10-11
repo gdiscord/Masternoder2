@@ -198,7 +198,19 @@ jobs:
             export CPPFLAGS="$CPPFLAGS -I$P/include"
             export LDFLAGS="$LDFLAGS -L$P/lib"
           fi
-          ./configure --prefix=/ --with-gui=qt5 --disable-tests --disable-bench
+          echo "=== OpenSSL we built ==="
+          grep -h "OPENSSL_VERSION_TEXT" "$SSL/include/openssl/opensslv.h" | head -n1 || true
+          ls -la "$SSL/lib" || true
+          echo "=== SSL checks in the project's configure.ac ==="
+          grep -rn -B6 -A6 "unsupported SSL" configure.ac build-aux/m4 2>/dev/null || true
+          echo "=== pkg-config view of libcrypto ==="
+          pkg-config --modversion libcrypto || true
+          pkg-config --cflags --libs libcrypto || true
+          ./configure --prefix=/ --with-gui=qt5 --disable-tests --disable-bench || {
+            echo "=== configure failed: RAND_egd link test from config.log ==="
+            grep -n -B2 -A25 "RAND_egd" config.log | head -n 120
+            exit 1
+          }
 
       # =====================================================================
       # Common: compile + package
