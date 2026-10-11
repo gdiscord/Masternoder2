@@ -206,6 +206,7 @@ jobs:
           echo "=== pkg-config view of libcrypto ==="
           pkg-config --modversion libcrypto || true
           pkg-config --cflags --libs libcrypto || true
+          export CXXFLAGS="-O2 -Wno-deprecated-copy -Wno-deprecated-declarations -Wno-error"
           ./configure --prefix=/ --with-gui=qt5 --disable-tests --disable-bench || {
             echo "=== configure failed: RAND_egd link test from config.log ==="
             awk '/checking for RAND_egd in -lcrypto/{f=1} f{print} f&&/result:/{exit}' config.log | head -n 60
@@ -216,7 +217,12 @@ jobs:
       # Common: compile + package
       # =====================================================================
       - name: Compile
-        run: make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+        run: |
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" || {
+            echo "=== compile failed; re-running single-threaded to show the real error ==="
+            make -j1 2>&1 | grep -E -B3 -A12 "error:|Error [0-9]|undefined reference|No such file" | head -n 200
+            exit 1
+          }
 
       - name: Install to dist/
         run: |
