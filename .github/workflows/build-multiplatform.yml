@@ -208,7 +208,7 @@ jobs:
           pkg-config --cflags --libs libcrypto || true
           ./configure --prefix=/ --with-gui=qt5 --disable-tests --disable-bench || {
             echo "=== configure failed: RAND_egd link test from config.log ==="
-            grep -n -B2 -A25 "RAND_egd" config.log | head -n 120
+            awk '/checking for RAND_egd in -lcrypto/{f=1} f{print} f&&/result:/{exit}' config.log | head -n 60
             exit 1
           }
 
