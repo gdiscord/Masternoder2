@@ -23,11 +23,11 @@ jobs:
             host: aarch64-linux-gnu
           - name: macos-arm64        # Apple Silicon
             os: macos-14
-            host: ""                 # detected via config.guess
+            host: ""
           - name: macos-x86_64       # Intel
             os: macos-15-intel
             host: ""
-          - name: windows-x86        # 32-bit, cross-compiled from Linux
+          - name: windows-x86        # 32-bit, cross-compiled from Linux (needs depends/)
             os: ubuntu-22.04
             host: i686-w64-mingw32
 
@@ -35,6 +35,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # ---------- Diagnose repo layout ----------
+      - name: Detect depends/ system
+        run: |
+          echo "--- repo root ---"; ls -la
+          echo "--- depends/ ---"; ls -la depends 2>&1 || true
+          if [ -f depends/Makefile ]; then
+            echo "USE_DEPENDS=true" >> "$GITHUB_ENV"
+            HOST="${{ matrix.host }}"
+            if [ -z "$HOST" ]; then HOST="$(./depends/config.guess)"; fi
+            echo "HOST=$HOST" >> "$GITHUB_ENV"
+          else
+            echo "USE_DEPENDS=false" >> "$GITHUB_ENV"
+            echo "::warning::depends/Makefile not found; using system Qt + BDB 4.8 built from source"
+            if [ "${{ matrix.name }}" = "windows-x86" ]; then
+              echo "::error::Windows cross-build needs a working depends/ directory. Copy it from the upstream project this is forked from."
+              exit 1
+            fi
+          fi
 
       # ---------- Build tools ----------
       - name: Install tools (Linux)
@@ -45,7 +64,6 @@ jobs:
             bsdmainutils curl git python3 patch bison gperf cmake ca-certificates zip
           if [ "${{ matrix.name }}" = "windows-x86" ]; then
             sudo apt-get install -y g++-mingw-w64-i686 mingw-w64-i686-dev nsis
-            # depends needs the posix threading flavour of MinGW
             sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-posix
             sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-posix
           fi
@@ -54,20 +72,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install automake libtool pkg-config coreutils python3 gnu-tar
 
-      # ---------- Resolve host triple ----------
-      - name: Check repo has depends/
-        run: |
-          if [ ! -d depends ]; then
-            echo "::error::No depends/ directory found. Cannot build bundled Qt + BDB 4.8."
-            exit 1
-          fi
-          HOST="${{ matrix.host }}"
-          if [ -z "$HOST" ]; then HOST="$(./depends/config.guess)"; fi
-          echo "HOST=$HOST" >> "$GITHUB_ENV"
-          echo "Using HOST=$HOST"
-
-      # ---------- Cache the (slow) dependency build ----------
+      # =====================================================================
+      # Path A: repo has a working depends/ (static Qt + BDB 4.8 + libs)
+      # =====================================================================
       - name: Cache depends
+        if: env.USE_DEPENDS == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -76,31 +85,92 @@ jobs:
           key: depends-${{ matrix.name }}-${{ hashFiles('depends/packages/**', 'depends/Makefile', 'depends/*.mk') }}
           restore-keys: depends-${{ matrix.name }}-
 
-      # ---------- Build dependencies (Qt 5, Berkeley DB 4.8, Boost, ...) ----------
       - name: Build depends
-        run: |
-          JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-          make -C depends HOST="$HOST" -j"$JOBS"
+        if: env.USE_DEPENDS == 'true'
+        run: make -C depends HOST="$HOST" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 
-      # ---------- Build wallet ----------
-      - name: Configure
+      - name: Configure (depends)
+        if: env.USE_DEPENDS == 'true'
         run: |
           ./autogen.sh
-          EXTRA=""
+          EXTRA="--enable-reduce-exports"
           case "${{ matrix.name }}" in
-            linux-*)
-              EXTRA="--enable-glibc-back-compat --enable-reduce-exports LDFLAGS=-static-libstdc++" ;;
-            windows-*)
-              EXTRA="--enable-reduce-exports" ;;
-            macos-*)
-              EXTRA="--enable-reduce-exports" ;;
+            linux-*) EXTRA="$EXTRA --enable-glibc-back-compat LDFLAGS=-static-libstdc++" ;;
           esac
           CONFIG_SITE="$PWD/depends/$HOST/share/config.site" ./configure \
-            --prefix=/ \
-            --with-gui=qt5 \
-            --disable-tests --disable-bench \
-            $EXTRA
+            --prefix=/ --with-gui=qt5 --disable-tests --disable-bench $EXTRA
 
+      # =====================================================================
+      # Path B: no depends/ -> system Qt 5 + BDB 4.8 built from source
+      # =====================================================================
+      - name: Install libraries (Linux)
+        if: env.USE_DEPENDS == 'false' && runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y libboost-all-dev libevent-dev libssl-dev \
+            libminiupnpc-dev libzmq3-dev libgmp-dev libsodium-dev \
+            qtbase5-dev qttools5-dev qttools5-dev-tools libqrencode-dev \
+            libprotobuf-dev protobuf-compiler
+
+      - name: Install libraries (macOS)
+        if: env.USE_DEPENDS == 'false' && runner.os == 'macOS'
+        run: |
+          brew install boost libevent openssl@3 miniupnpc zeromq gmp libsodium \
+            qt@5 qrencode protobuf
+
+      - name: Cache Berkeley DB 4.8
+        if: env.USE_DEPENDS == 'false'
+        id: bdbcache
+        uses: actions/cache@v4
+        with:
+          path: ~/bdb48
+          key: bdb48-${{ matrix.name }}-v1
+
+      - name: Build Berkeley DB 4.8
+        if: env.USE_DEPENDS == 'false' && steps.bdbcache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          if [ -x contrib/install_db4.sh ]; then
+            ./contrib/install_db4.sh "$HOME/bdb-tmp"
+            mv "$HOME/bdb-tmp/db4" "$HOME/bdb48"
+          else
+            cd "$RUNNER_TEMP"
+            curl -fL -o db-4.8.30.NC.tar.gz https://download.oracle.com/berkeley-db/db-4.8.30.NC.tar.gz
+            echo "12edc0df75bf9abd7f82f821795bcee50f42cb2e5f76a6a281b85732798364ef  db-4.8.30.NC.tar.gz" | shasum -a 256 -c -
+            tar xzf db-4.8.30.NC.tar.gz
+            cd db-4.8.30.NC
+            # Fix for modern compilers
+            sed -i.bak 's/__atomic_compare_exchange/__atomic_compare_exchange_db/g' dbinc/atomic.h
+            # Old config.guess/sub don't know aarch64 / arm64
+            for f in config.guess config.sub; do
+              src="$(ls /usr/share/automake-*/$f "$(brew --prefix 2>/dev/null)"/share/automake-*/$f 2>/dev/null | head -n1)"
+              cp "$src" dist/$f
+            done
+            cd build_unix
+            ../dist/configure --enable-cxx --disable-shared --disable-replication \
+              --with-pic --prefix="$HOME/bdb48"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+            make install
+          fi
+
+      - name: Configure (system libs)
+        if: env.USE_DEPENDS == 'false'
+        run: |
+          set -e
+          ./autogen.sh
+          export BDB_CFLAGS="-I$HOME/bdb48/include"
+          export BDB_LIBS="-L$HOME/bdb48/lib -ldb_cxx-4.8"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            P="$(brew --prefix)"
+            export PATH="$(brew --prefix qt@5)/bin:$PATH"
+            export PKG_CONFIG_PATH="$(brew --prefix qt@5)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$PKG_CONFIG_PATH"
+            export CPPFLAGS="-I$P/include"
+            export LDFLAGS="-L$P/lib"
+          fi
+          ./configure --prefix=/ --with-gui=qt5 --disable-tests --disable-bench
+
+      # =====================================================================
+      # Common: compile + package
+      # =====================================================================
       - name: Compile
         run: make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 
