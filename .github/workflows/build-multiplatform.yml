@@ -8,117 +8,106 @@ on:
 jobs:
   build:
     name: ${{ matrix.name }}
-    # Manual runs from other branches are skipped
     if: github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-x86_64
-            os: ubuntu-24.04
+            os: ubuntu-22.04
+            host: x86_64-pc-linux-gnu
           - name: linux-arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
+            host: aarch64-linux-gnu
           - name: macos-arm64        # Apple Silicon
             os: macos-14
+            host: ""                 # detected via config.guess
           - name: macos-x86_64       # Intel
             os: macos-15-intel
-          - name: windows-x86        # 32-bit
-            os: windows-latest
-            msystem: MINGW32
-
-    defaults:
-      run:
-        shell: ${{ matrix.msystem && 'msys2 {0}' || 'bash' }}
+            host: ""
+          - name: windows-x86        # 32-bit, cross-compiled from Linux
+            os: ubuntu-22.04
+            host: i686-w64-mingw32
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # ---------- Toolchains ----------
-      - name: Setup MSYS2 (32-bit MinGW)
-        if: matrix.msystem
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: ${{ matrix.msystem }}
-          update: true
-          install: >-
-            make
-            autoconf
-            automake
-            libtool
-            pkgconf
-            git
-          pacboy: >-
-            toolchain:p
-            cmake:p
-            ninja:p
-
-      - name: Install deps (Linux)
+      # ---------- Build tools ----------
+      - name: Install tools (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build pkg-config autoconf automake libtool
+          sudo apt-get install -y build-essential libtool autotools-dev automake pkg-config \
+            bsdmainutils curl git python3 patch bison gperf cmake ca-certificates zip
+          if [ "${{ matrix.name }}" = "windows-x86" ]; then
+            sudo apt-get install -y g++-mingw-w64-i686 mingw-w64-i686-dev nsis
+            # depends needs the posix threading flavour of MinGW
+            sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-posix
+            sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-posix
+          fi
 
-      - name: Install deps (macOS)
+      - name: Install tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake ninja pkg-config autoconf automake libtool
+        run: brew install automake libtool pkg-config coreutils python3 gnu-tar
 
-      - name: Setup Go
-        if: ${{ hashFiles('go.mod') != '' }}
-        uses: actions/setup-go@v5
-        with:
-          go-version: stable
-
-      - name: Setup Rust
-        if: ${{ hashFiles('Cargo.toml') != '' }}
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.msystem && 'i686-pc-windows-gnu' || '' }}
-
-      - name: Setup Node
-        if: ${{ hashFiles('package.json') != '' }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
-      # ---------- Build (auto-detects build system) ----------
-      - name: Build
+      # ---------- Resolve host triple ----------
+      - name: Check repo has depends/
         run: |
-          set -e
-          mkdir -p dist
-          if [ -f CMakeLists.txt ]; then
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-            cmake --build build --config Release
-            cp -r build dist/
-          elif [ -f autogen.sh ] || [ -f configure.ac ] || [ -f configure ]; then
-            [ -f configure ] || { [ -f autogen.sh ] && ./autogen.sh || autoreconf -fi; }
-            ./configure --prefix="$PWD/dist/install"
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-            make install
-          elif [ -f Makefile ] || [ -f makefile ]; then
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-            cp -r . dist/build-tree 2>/dev/null || true
-          elif [ -f go.mod ]; then
-            if [ -n "${{ matrix.msystem }}" ]; then export GOOS=windows GOARCH=386; fi
-            go build -o dist/ ./...
-          elif [ -f Cargo.toml ]; then
-            if [ -n "${{ matrix.msystem }}" ]; then
-              cargo build --release --target i686-pc-windows-gnu
-              cp -r target/i686-pc-windows-gnu/release dist/
-            else
-              cargo build --release
-              cp -r target/release dist/
-            fi
-          elif [ -f package.json ]; then
-            npm ci || npm install
-            npm run build --if-present
-            cp -r dist/. dist/ 2>/dev/null || true
-          else
-            echo "No known build system found" >&2
+          if [ ! -d depends ]; then
+            echo "::error::No depends/ directory found. Cannot build bundled Qt + BDB 4.8."
             exit 1
           fi
+          HOST="${{ matrix.host }}"
+          if [ -z "$HOST" ]; then HOST="$(./depends/config.guess)"; fi
+          echo "HOST=$HOST" >> "$GITHUB_ENV"
+          echo "Using HOST=$HOST"
+
+      # ---------- Cache the (slow) dependency build ----------
+      - name: Cache depends
+        uses: actions/cache@v4
+        with:
+          path: |
+            depends/built
+            depends/sources
+          key: depends-${{ matrix.name }}-${{ hashFiles('depends/packages/**', 'depends/Makefile', 'depends/*.mk') }}
+          restore-keys: depends-${{ matrix.name }}-
+
+      # ---------- Build dependencies (Qt 5, Berkeley DB 4.8, Boost, ...) ----------
+      - name: Build depends
+        run: |
+          JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          make -C depends HOST="$HOST" -j"$JOBS"
+
+      # ---------- Build wallet ----------
+      - name: Configure
+        run: |
+          ./autogen.sh
+          EXTRA=""
+          case "${{ matrix.name }}" in
+            linux-*)
+              EXTRA="--enable-glibc-back-compat --enable-reduce-exports LDFLAGS=-static-libstdc++" ;;
+            windows-*)
+              EXTRA="--enable-reduce-exports" ;;
+            macos-*)
+              EXTRA="--enable-reduce-exports" ;;
+          esac
+          CONFIG_SITE="$PWD/depends/$HOST/share/config.site" ./configure \
+            --prefix=/ \
+            --with-gui=qt5 \
+            --disable-tests --disable-bench \
+            $EXTRA
+
+      - name: Compile
+        run: make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+
+      - name: Install to dist/
+        run: |
+          mkdir -p dist
+          make install DESTDIR="$PWD/dist"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
