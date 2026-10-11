@@ -156,19 +156,47 @@ jobs:
           make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
           make install
 
+      - name: Cache OpenSSL 1.1.1
+        if: env.USE_DEPENDS == 'false'
+        id: ssl_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/openssl111
+          key: openssl111w-${{ matrix.name }}-v1
+
+      - name: Build OpenSSL 1.1.1w (project rejects OpenSSL 3)
+        if: env.USE_DEPENDS == 'false' && steps.ssl_cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 5 --retry-delay 5 -o openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/openssl-1.1.1w.tar.gz \
+            || curl -fL --retry 5 --retry-delay 5 -o openssl.tar.gz \
+            https://www.openssl.org/source/openssl-1.1.1w.tar.gz
+          echo "cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8  openssl.tar.gz" | shasum -a 256 -c -
+          tar xzf openssl.tar.gz
+          cd openssl-1.1.1w
+          ./config no-shared no-tests -fPIC --prefix="$HOME/openssl111" --openssldir="$HOME/openssl111" --libdir=lib
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          make install_sw
+
       - name: Configure (system libs)
         if: env.USE_DEPENDS == 'false'
         run: |
           set -e
           ./autogen.sh
+          SSL="$HOME/openssl111"
           export BDB_CFLAGS="-I$HOME/bdb48/include"
           export BDB_LIBS="-L$HOME/bdb48/lib -ldb_cxx-4.8"
+          export PKG_CONFIG_PATH="$SSL/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export CPPFLAGS="-I$SSL/include"
+          export LDFLAGS="-L$SSL/lib"
           if [ "${{ runner.os }}" = "macOS" ]; then
             P="$(brew --prefix)"
             export PATH="$(brew --prefix qt@5)/bin:$PATH"
-            export PKG_CONFIG_PATH="$(brew --prefix qt@5)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$PKG_CONFIG_PATH"
-            export CPPFLAGS="-I$P/include"
-            export LDFLAGS="-L$P/lib"
+            export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$(brew --prefix qt@5)/lib/pkgconfig"
+            export CPPFLAGS="$CPPFLAGS -I$P/include"
+            export LDFLAGS="$LDFLAGS -L$P/lib"
           fi
           ./configure --prefix=/ --with-gui=qt5 --disable-tests --disable-bench
 
