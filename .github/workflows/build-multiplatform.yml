@@ -162,7 +162,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/openssl111
-          key: openssl111w-${{ matrix.name }}-v1
+          key: openssl111w-egd-${{ matrix.name }}-v2
 
       - name: Build OpenSSL 1.1.1w (project rejects OpenSSL 3)
         if: env.USE_DEPENDS == 'false' && steps.ssl_cache.outputs.cache-hit != 'true'
@@ -176,7 +176,7 @@ jobs:
           echo "cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8  openssl.tar.gz" | shasum -a 256 -c -
           tar xzf openssl.tar.gz
           cd openssl-1.1.1w
-          ./config no-shared no-tests -fPIC --prefix="$HOME/openssl111" --openssldir="$HOME/openssl111" --libdir=lib
+          ./config no-shared no-tests enable-egd -fPIC --prefix="$HOME/openssl111" --openssldir="$HOME/openssl111" --libdir=lib
           make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
           make install_sw
 
