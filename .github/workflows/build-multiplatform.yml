@@ -1,0 +1,128 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    # Manual runs from other branches are skipped
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: macos-arm64        # Apple Silicon
+            os: macos-14
+          - name: macos-x86_64       # Intel
+            os: macos-15-intel
+          - name: windows-x86        # 32-bit
+            os: windows-latest
+            msystem: MINGW32
+
+    defaults:
+      run:
+        shell: ${{ matrix.msystem && 'msys2 {0}' || 'bash' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---------- Toolchains ----------
+      - name: Setup MSYS2 (32-bit MinGW)
+        if: matrix.msystem
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            make
+            autoconf
+            automake
+            libtool
+            pkgconf
+            git
+          pacboy: >-
+            toolchain:p
+            cmake:p
+            ninja:p
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config autoconf automake libtool
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja pkg-config autoconf automake libtool
+
+      - name: Setup Go
+        if: ${{ hashFiles('go.mod') != '' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Setup Rust
+        if: ${{ hashFiles('Cargo.toml') != '' }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.msystem && 'i686-pc-windows-gnu' || '' }}
+
+      - name: Setup Node
+        if: ${{ hashFiles('package.json') != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      # ---------- Build (auto-detects build system) ----------
+      - name: Build
+        run: |
+          set -e
+          mkdir -p dist
+          if [ -f CMakeLists.txt ]; then
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --config Release
+            cp -r build dist/
+          elif [ -f autogen.sh ] || [ -f configure.ac ] || [ -f configure ]; then
+            [ -f configure ] || { [ -f autogen.sh ] && ./autogen.sh || autoreconf -fi; }
+            ./configure --prefix="$PWD/dist/install"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+            make install
+          elif [ -f Makefile ] || [ -f makefile ]; then
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+            cp -r . dist/build-tree 2>/dev/null || true
+          elif [ -f go.mod ]; then
+            if [ -n "${{ matrix.msystem }}" ]; then export GOOS=windows GOARCH=386; fi
+            go build -o dist/ ./...
+          elif [ -f Cargo.toml ]; then
+            if [ -n "${{ matrix.msystem }}" ]; then
+              cargo build --release --target i686-pc-windows-gnu
+              cp -r target/i686-pc-windows-gnu/release dist/
+            else
+              cargo build --release
+              cp -r target/release dist/
+            fi
+          elif [ -f package.json ]; then
+            npm ci || npm install
+            npm run build --if-present
+            cp -r dist/. dist/ 2>/dev/null || true
+          else
+            echo "No known build system found" >&2
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Masternoder2-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
